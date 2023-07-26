@@ -28,7 +28,6 @@ async fn main() -> iota_wallet::Result<()> {
     // Migration
     let legacy_node = "https://nodes.devnet.iota.org";
     let seed = "TRYTESEEDTRYTESEEDTRYTESEEDTRYTESEEDTRYTESEEDTRYTESEEDTRYTESEEDTRYTESEEDTRYTESEED";
-    let min_weight_magnitude = 9;
 
     // Get account data
     let mut address_index = 0;
@@ -73,9 +72,7 @@ async fn main() -> iota_wallet::Result<()> {
     }
 
     for hash in bundle_hashes {
-        manager
-            .send_migration_bundle(&[legacy_node], &hash, min_weight_magnitude)
-            .await?;
+        manager.send_migration_bundle(&[legacy_node], &hash).await?;
         println!("Bundle sent, hash: {}", hash);
     }
 

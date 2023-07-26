@@ -628,7 +628,7 @@ impl AccountManager {
     }
 
     /// Sends the migration bundle to the given node.
-    pub async fn send_migration_bundle(&self, nodes: &[&str], hash: &str, mwm: u8) -> crate::Result<MigratedBundle> {
+    pub async fn send_migration_bundle(&self, nodes: &[&str], hash: &str) -> crate::Result<MigratedBundle> {
         let (bundle, address, value) = self
             .cached_migration_bundles
             .lock()
@@ -636,7 +636,7 @@ impl AccountManager {
             .get(hash)
             .ok_or(crate::Error::MigrationBundleNotFound)?
             .clone();
-        let tail_transaction_hash = migration::send_bundle(nodes, bundle.to_vec(), mwm).await?;
+        let tail_transaction_hash = migration::send_bundle(nodes, bundle.to_vec()).await?;
         self.cached_migration_bundles.lock().await.remove(hash);
 
         Ok(MigratedBundle {
@@ -656,7 +656,6 @@ impl AccountManager {
         &self,
         nodes: &[&str],
         bundle: Vec<String>,
-        mwm: u8,
     ) -> crate::Result<MigratedBundle> {
         let trytes = bundle
             .into_iter()
@@ -678,7 +677,7 @@ impl AccountManager {
             .cloned()
             .collect::<Vec<BundledTransaction>>()[0]
             .clone();
-        let tail_transaction_hash = migration::send_bundle(nodes, trytes, mwm).await?;
+        let tail_transaction_hash = migration::send_bundle(nodes, trytes).await?;
 
         let bech32_hrp = match self.get_account(0).await {
             Ok(account_handle) => account_handle.read().await.bech32_hrp(),

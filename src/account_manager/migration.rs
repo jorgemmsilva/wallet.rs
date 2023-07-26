@@ -9,7 +9,7 @@ use crate::{
 use chrono::prelude::Utc;
 use serde::{Deserialize, Serialize};
 
-use iota_migration::crypto::hashes::ternary::{curl_p::CurlP, Hash as TernaryHash};
+use iota_migration::transaction::Vertex;
 pub(crate) use iota_migration::{
     client::{
         migration::{
@@ -20,6 +20,11 @@ pub(crate) use iota_migration::{
     crypto::keys::ternary::seed::Seed as TernarySeed,
     ternary::{T1B1Buf, T3B1Buf, TritBuf, TryteBuf},
     transaction::bundled::{BundledTransaction, BundledTransactionField},
+};
+use iota_migration::{
+    crypto::hashes::ternary::{curl_p::CurlP, Hash as TernaryHash},
+    ternary::{raw, Btrit},
+    transaction::bundled,
 };
 
 use std::{
@@ -408,120 +413,224 @@ pub(crate) async fn create_bundle<P: AsRef<Path>>(
 pub(crate) async fn send_bundle(
     nodes: &[&str],
     bundle: Vec<BundledTransaction>,
-    mwm: u8,
 ) -> crate::Result<iota_migration::crypto::hashes::ternary::Hash> {
-    let mut builder = iota_migration::ClientBuilder::new();
-    for node in nodes {
-        builder = builder.node(node)?;
-    }
-    let legacy_client = builder.build()?;
+    let bytes = isc_req_from_bundle(bundle);
+    // TODO ...
+    // ---
+    let trits = TritBuf::<T1B1Buf>::zeros(BundledTransaction::trit_len());
+    let mut curl = CurlP::new();
+    let tail_transaction_hash = TernaryHash::from_inner_unchecked(curl.digest(&trits));
+    Ok(tail_transaction_hash)
+}
 
-    let bundle_hash = *bundle.first().unwrap().bundle();
-    let bundle_hash_string = bundle_hash
-        .to_inner()
+pub fn isc_param_bytes_from_bundle(bundle: Vec<BundledTransaction>) -> Vec<u8> {
+    let raw_trytes: Vec<String> = bundle.iter().map(tx_trytes).collect();
+    let mut encoded_bundle = Vec::<u8>::new();
+    encoded_bundle.push(raw_trytes.len() as u8);
+
+    // t5b1 encoding doesn't seem to work properly.
+    // for tx_trytes in raw_trytes {
+    //     // use T5B1 encode to convert string trytes into bytes
+    //     let buf = tx_trytes
+    //         .chars()
+    //         .map(iota_migration::ternary::Tryte::try_from)
+    //         .collect::<Result<iota_migration::ternary::TryteBuf, _>>()
+    //         .unwrap()
+    //         .as_trits()
+    //         .encode::<iota_migration::ternary::T5B1Buf>();
+
+    //     // length prefix
+    //     let buf_slice = buf.as_i8_slice();
+    //     encoded_bundle.append(&mut (buf_slice.len() as u16).to_le_bytes().to_vec());
+    //     // write the bytes
+    //     for b in buf_slice {
+    //         encoded_bundle.push(*b as u8)
+    //     }
+    //     // encoded_bundle.append(&mut tx_trytes.as_bytes().to_vec());
+    // }
+
+    //use UTF8 encoding for the trytes
+    for tx_trytes in raw_trytes {
+        encoded_bundle.append(&mut (tx_trytes.len() as u16).to_le_bytes().to_vec());
+        encoded_bundle.append(&mut tx_trytes.as_bytes().to_vec());
+    }
+    encoded_bundle
+}
+
+pub fn isc_req_from_bundle(bundle: Vec<BundledTransaction>) -> Vec<u8> {
+    let mut req: Vec<u8> = vec![1]; // 1 is "requestKindOffLedgerISC"
+
+    // TODO add the correct chainID, this is just a dummy one for testing
+    let chain_id = "d5d8794ccc01f7ca0c7ccb6bcc6db4c97c322646da356f5f94b8946c03b08048";
+    req.append(&mut hex::decode(chain_id).unwrap()); // ISC chainID (32 bytes) (aliasID of the chain output)
+    req.append(&mut hex::decode("69492005").unwrap()); //contractHname
+    req.append(&mut hex::decode("060d3f50").unwrap()); //migration entrypoint Hname
+
+    // params
+    req.push(1); // params len
+    req.push(1); //key len
+    req.append(&mut "b".as_bytes().to_vec()); // key "b"
+    let mut bundle_bytes = isc_param_bytes_from_bundle(bundle);
+    println!("{}", bundle_bytes.len());
+    req.append(&mut isc_vlu_encode(bundle_bytes.len() as u64)); //bundle length
+    req.append(&mut bundle_bytes); //bundle bytes
+
+    req.append(&mut 0_u64.to_le_bytes().to_vec()); // nonce
+    req.push(0); // gasbudget
+    req.push(0); // allowance
+
+    // add 33 bytes (32 for empty pubkey and one extra 0 for the signature)
+    for _ in 0..33 {
+        req.push(0);
+    }
+
+    req
+}
+
+// ---------------
+
+// copied from iota.rs 656279e628e5f9d9288477cd4d2dc4170ea4bf0e util crate, that's not publicly exported for some reason
+fn tx_trytes(tx: &bundled::BundledTransaction) -> String {
+    let bundle = tx
+        .bundle()
         .encode::<T3B1Buf>()
         .iter_trytes()
         .map(char::from)
         .collect::<String>();
 
-    emit_migration_progress(MigrationProgressType::BroadcastingBundle {
-        bundle_hash: bundle_hash_string.clone(),
-    })
-    .await;
-
-    let send_trytes = legacy_client
-        .send_trytes()
-        .with_trytes(bundle)
-        .with_depth(2)
-        .with_min_weight_magnitude(mwm)
-        .finish()
-        .await?;
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok(r) = check_confirmation(&legacy_client, &bundle_hash, &bundle_hash_string).await {
-                if r {
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    fn num_to_tryte_string(num: i64, len: usize) -> String {
+        let mut trytes: TritBuf<T1B1Buf> = num.into();
+        let n = len - trytes.len();
+        for _ in 0..n {
+            trytes.push(Btrit::Zero);
         }
-    })
-    .await?;
-    let mut trits = TritBuf::<T1B1Buf>::zeros(BundledTransaction::trit_len());
-    let mut curl = CurlP::new();
-    send_trytes[0].as_trits_allocated(&mut trits);
-    let tail_transaction_hash = TernaryHash::from_inner_unchecked(curl.digest(&trits));
-    Ok(tail_transaction_hash)
+        trytes
+            .encode::<T3B1Buf>()
+            .iter_trytes()
+            .map(char::from)
+            .collect::<String>()
+    }
+
+    tx.payload()
+        .to_inner()
+        .encode::<T3B1Buf>()
+        .iter_trytes()
+        .map(char::from)
+        .collect::<String>()
+        + &tx
+            .address()
+            .to_inner()
+            .encode::<T3B1Buf>()
+            .iter_trytes()
+            .map(char::from)
+            .collect::<String>()
+        + &num_to_tryte_string(*tx.value().to_inner(), 81)
+        + &tx
+            .obsolete_tag()
+            .to_inner()
+            .encode::<T3B1Buf>()
+            .iter_trytes()
+            .map(char::from)
+            .collect::<String>()
+        + &num_to_tryte_string(*tx.timestamp().to_inner() as i64, 27)
+        + &num_to_tryte_string(*tx.index().to_inner() as i64, 27)
+        + &num_to_tryte_string(*tx.last_index().to_inner() as i64, 27)
+        + &bundle
+        + &tx
+            .trunk()
+            .encode::<T3B1Buf>()
+            .iter_trytes()
+            .map(char::from)
+            .collect::<String>()
+        + &tx
+            .branch()
+            .encode::<T3B1Buf>()
+            .iter_trytes()
+            .map(char::from)
+            .collect::<String>()
+        + &tx
+            .tag()
+            .to_inner()
+            .encode::<T3B1Buf>()
+            .iter_trytes()
+            .map(char::from)
+            .collect::<String>()
+        + &num_to_tryte_string(*tx.attachment_ts().to_inner() as i64, 27)
+        + &num_to_tryte_string(*tx.attachment_lbts().to_inner() as i64, 27)
+        + &num_to_tryte_string(*tx.attachment_ubts().to_inner() as i64, 27)
+        + &tx
+            .nonce()
+            .to_inner()
+            .encode::<T3B1Buf>()
+            .iter_trytes()
+            .map(char::from)
+            .collect::<String>()
 }
 
-async fn check_confirmation(
-    legacy_client: &iota_migration::Client,
-    bundle_hash: &iota_migration::crypto::hashes::ternary::Hash,
-    bundle_hash_string: &str,
-) -> crate::Result<bool> {
-    log::debug!("[MIGRATION] checking confirmation for bundle `{}`", bundle_hash_string);
-    let hashes = legacy_client
-        .find_transactions()
-        .bundles(&[*bundle_hash])
-        .send()
-        .await?
-        .hashes;
-    let transactions = legacy_client.get_trytes(&hashes).await?.trytes;
-    let mut infos = Vec::new();
-    for transaction in transactions {
-        if transaction.is_tail() {
-            let mut trits = TritBuf::<T1B1Buf>::zeros(BundledTransaction::trit_len());
-            let mut curl = CurlP::new();
-            transaction.as_trits_allocated(&mut trits);
-            let tail_transaction_hash = TernaryHash::from_inner_unchecked(curl.digest(&trits));
-            let info = legacy_client.get_tip_info(&tail_transaction_hash).await?;
-            infos.push((tail_transaction_hash, info));
-        }
+// vlu (variable length unsigned) encoder
+// custom encoding used by WASP/ISC - taken from:   https://github.com/iotaledger/wasp/blob/2071625c1500c211e590cdb6f836625347a99408/packages/wasmvm/wasmlib/src/wasmtypes/codec.rs#L192
+pub fn isc_vlu_encode(mut value: u64) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    // first group of 7 bits
+    // 1st byte encodes 0 as positive in bit 6
+    let mut b = value as u8;
+    value >>= 7;
+
+    // keep shifting until all bits are done
+    while value != 0 {
+        // emit with continuation bit
+        buf.push(b | 0x80);
+
+        // next group of 7 bits
+        b = value as u8;
+        value >>= 7;
     }
 
-    // check if the transaction was confirmed
-    if infos.iter().any(|(_, i)| i.confirmed) {
-        log::debug!("[MIGRATION] bundle `{}` confirmed", bundle_hash_string);
-        emit_migration_progress(MigrationProgressType::TransactionConfirmed {
-            bundle_hash: bundle_hash_string.to_string(),
-        })
-        .await;
-        return Ok(true);
+    // emit without continuation bit
+    buf.push(b);
+    buf
+}
+
+/// --- tests
+
+#[cfg(test)]
+mod tests {
+    use iota_migration::{ternary::TryteBuf, transaction::bundled::BundledTransaction};
+
+    use crate::account_manager;
+
+    fn valid_bundle() -> Vec<BundledTransaction> {
+        let raw_trytes = vec![
+            "999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999TRANSFERNEGYZXAZKAPBOWHAVXHDWAJDYWOZWAMZODFBUBGCQEQ9XWCDUDBDFZXDTBGADXTWMDSDOEZD9NBQWWHA99999999999999999999WF99999999999999999999999999ZOQMFD99999999999C99999999APKIUYNXZLRLYCUYJRGTFTSYLCYJYEDCYJAFZOIRTYLLJNUOOJSGKPXLGKWADLHZICOUJXXLHEJSHYJHCMMKBXTDRTVMXNEIAYJCUMNCGKNQVSEUPKCZGJACCJ9AFFGVCGQXGSCKKOUBQQBJDXLMOMMVEZKRYZ99999V9PJWPAOYWURYYKGZZDBELYBWTXCFIVLJMUDSWWKFQQYTXFPNVJSCKBMDZRRRGBSYTQSWQDAGNZZ9999WF9999999999999999999999999QDJYGNAVF999999999MMMMMMMMMWVCLW9HGRAWJTEHKEBLBXTZCUXR",
+            "QNABYZVQFZZWAAQKJIPNRWIRZJBOWMSLO9ROXXBEDNBBQRABWOBYI9BFXOU9YUS9CPAWRVKATGVUWUXTAMTRUMNR9BBCMYCPISYHWDOWCPROBZMYGUET9RRYVIOLXILTZNYMNAWXHDDIAGKMKLUDRSTGCTUBVDVPVDWYDKRWJPGTTZDAPVESCYBGGFORFDYYCUKWFKXQAWYZNWFYDIV9QMHGVNPVFRXBZFAFBVXWNEAYLEBNFN9PXRJQXAOGINGMFCKMPLMRDOWUZLLGEDVWVEIFFLNVITHGJXWKZE9QMPCRNUSZZBMQO9HK9DORTCNEIIECMTRQMAZKJFTFAJMXWBAGJ9LVWN9EYBZZTZZVPTLDRAIRZERLMKCVCSOMXTPFQOYJKCPQLPOUTYMEQENUCKJAZHJIJXGGBVEJQRZRRQWPSQ9JZPAEMESOZXKSNQJBLEDBCBZLTQVRDOJFGYHNGIYRVPATVRH9FLOGXWJTLWNDYABIDGFPFYYJFOKUKNOYCBOBTNHCCNHFCCKRFWPTFIEOESTTS9LXF9ABMLDJOZODMTLZZHKHTMCTVBGLOSHNUQ9TZKIEAX9AUMPHPSLDH99PCVWJSEGVKGSYMQWEKJCJBLGCRREHVTJETZEEODPZUMPALJEDRFNLITDLIXBDWDOL9OUXRLRZJYRHZIGGUGJZNWRIOFHTWXTMOMYQJBNKMNCTDPDKHYJNGBECRTPZAT999AYBMRM9VEOEIVZKRLHDVLREIIXXJYNMQYWTO9RSXSXOMCU9HYHZTZHGQOIFTNRQLLUPKWKGRUTOAPJSQAOVRAHGZJKHEAINBKSDDYARNALDVMILHYVPTOHCFVKECUIBMW99ILZGBOVURYKYVJBLGMRWIKSUTNBA9X9WMRZUZHDCWQKLTJBSBVLOZQFJDCYGZHNNITJLTDNSAVLAOO9KYBVQV9AQNJUQKPGCWBPVPVUETECYHMTDQRNUERA9WUXUXUUCAFQEANCOJCJWDHEDZPMMTTJXHPPNHMMJGXCACBZKSQXPLWYIDNHG9DEMFOC9WWYB9TCXMGLG9IAGYMLZDXIEMGACFVLGAXPBWULUHCHDZBDLVUBLTVGDEC9XOEGZTAYVAIJQ9EEYDBI9YSDZ9XNXOUDAU9XXLUUFXSXLHOTSCFMHEFABMK9XBZDCRSJMYEVIPSBKEALFXBQPFD9GGQJIOEKCQHFDZAOWJYWEWEFANXKFIQTNYBZBCQSKL9UMBDJQRHGAIMNLPLWHBPQOCMDLGRXELHW9ERUDI9SNQ9GWGTIFIOXZALQXRNVBVXDSJORLXMRRIAVWNMIAALDYRCVGPYZNYPQZOMIBM9FXCUUULTYIB9JOZR9UMEIGNER9XWO9IQLADAYHPJCDQTCWPCJNZHKPBOWNDPFFMDNIVWFBUUJMRQPZWFOXXF9EEMHEYUHNCBAJHWDIGWVXRTB9GOYUJWDRS9MILSQDQVZUKYVNUZUHZOJEGRZUGNZFPVZKDFCKAW9KNWNSHEWBQXITKKJWQAQYBUQEZKSFSOQBCVDSOGVAIHXLKUNGOMJVVRXXPCBLOILTIEQDWAGTPQWVNQNQMSNGFAQZVXHZIJFEGIFK9YOTSSGPZDAUUNQYKLFMMXPJZKUKTRBZZZP9JWTDRZTKNSJWEWOTORWTYSGOUNRLRIBPQIKZBSMILWPYEWNCGGOA9DAEDUEMYUHAFWB9XCZGILTQAPSNIFAWZSFHQFEPFGGRHUIZHZEXFHTUTY9UKGYDY9QHISNYBZFYSRHCCXVUMFLVMAJWYXUDGOSKXHCP9KKBMFJOCV9CTUQMBCW9FL9AXMABWPFYQDRYCAIPXLNJCWNKXDB9ZVKYRGVXQKGIRBAJB9XTDEKKEDGYCKLJOSJIIVSVOLDHISUSOJ9VIJLNWIOZCDBPNSJTFPJHCNLCGPWHJFQXEIRPUHLPF9JZKHMMPYJMWPVTSSGBABDXUPGDVDHVFPGOBTDTURWQTWTEKBFJLCXGESOWXRQPCTQYQBB9RQJUVYRXVMGNXOUIGMFDWBDEWKRMPOWZYGGYMLODKKXHLEUVBXKERAAHQYEYDIKYVABMO9KUJIARSEEUXTI9LBQLDCUFNDPZNWUSRWEE9KTQOXSNMCDQNGRBOZC9VVWWEEQAVFJYJPCPCYROCVE9WGHW9OSPFUKWDJXPXNMEHCKPOYBFWIURWEIEMAGWWPXVWDTMVUZVNYNYFOB9S9WIGHRNYVZBJEBBWQZIBWYIOZLKPGVNNCOLDIIUNNEQZYBDMYJDDSZ999999999999999999999999999999999999999999999999ZOQMFD99A99999999C99999999APKIUYNXZLRLYCUYJRGTFTSYLCYJYEDCYJAFZOIRTYLLJNUOOJSGKPXLGKWADLHZICOUJXXLHEJSHYJHCDJQNKMKBCABQASYTQCCBXLOMXXBHKQEQFLSYA9LBALUKPZPDZCXGMTAJZCHQVPNCQVJPMCRI9STF999999V9PJWPAOYWURYYKGZZDBELYBWTXCFIVLJMUDSWWKFQQYTXFPNVJSCKBMDZRRRGBSYTQSWQDAGNZZ9999999999999999999999999999999CVCXGNAVF999999999MMMMMMMMMPXUWJKPOHBMBDNZYWXEGGSEHGAK",
+            "AAPQEIUASRNMDUIUIADDXTMZ9PZJDCCHMTSFQIRYNGCUABRFDIILYQNBLTJNZHALKF9OFJGYTTDVKIQADREXTTPLAVDYSACOMNHTLXMUQPLTWMKOJAL9PZKVVGSDULFVNJMRBHGGEGWDAPBJCLSCFJCMFGTXDBFMPBDFLULKVCPIYLBEYWHIKPOFNQUMCLIELTVRVISYIM9LJPTQXGZQTEKQPLWXKYMIOHISGGTKQUKICOKTEKDRFVNIMNVRSUQHIAOAVXLJKTDQTHLMCZLOZCZRJOTSAVRPRIJCV9ETFI9DSLDR9BVJDEXFVOJUCQLI9JZDO9FP9TRN9MTGET9RIPNTASM9AINXMLITAZOIAMFDZFVWBCUXWBZLNGTLM9CHHKVIZLUPWGUKFGNTBJHBCPDXFRKJHRGBGHMAOPRAAJUALPFKFEIUPKAHFB9PVTKITR9J9RES9HDQLNVQBYMZZBBSRKEUSKDNHXVWKYWPRGTYFSWVALINKDSSQCSU9NVSRF9YTODXOOGNBZYUEVCYMKBWVAULDICZKUNTQSWHGQ9FMAZMIQZPGLDDHTOMDNSGRHZIS9VRU9JPVL9HZO9XRNXH9KQIFAJOQYCRNNYBRUUIVOXMPZXRECBWFIZKIJVOKJYWCXQXTYNRLV9HSYQMKGEYLTUAHPMPWJBTGMHRUIRRMNQWMQYBOAKGJBNFJMDLSUYGFADJTLLUMHJDFKLJGRBTXFAXLMXWICKUWCKCNCXEUWQTUX9KBBINVFYKXBTSHGPLTCBTRGPZGJGCFYJICNPPZLXRWKHRGVHUOWDIODHEVLOJGBKMOCTPUTKGMNSTCTRW9RDQ9RUPSPYQSIZR9GHQUMRNVI9JOLSJHXXUMHKXV9JBE9OQOEXAKZWYIHRMAV9ZPIHFTHNZCTQKVDSRBXEMAJPTASTTLBBQGIKPQUOYXWKWGHGUNKEEZCCBYXECQKCUWGXTROWWWQPOUT99HBOCQWQEMINGIW9KRQDDYXFMSPJOACFUJAFRQWHCNUG9OBWWPKLBFJ9IRAMSAEWEAU9FCJJWX9NSMHUZQNRPDDSXGSTVCGNDWKJARLDJ9NYDCAXLCXHIWWAYEEUIOLQHGIUIWPYBP9QHEDERBACOZTIOKWZMZDNKXQVPBTJJB9PESPPBHVVGIWBLJPMNZL9ZLSXRWCYZDYUQQB9BTGUHYMGJSVJSLXDOJ9IPIPSTJRXDK9XFADXJCIXCXFHGRLUCRSBTWTTOWJDKBOXNYREKLIJULBTCKIFJG9QKUCWYRGC9KNOSYY9D9XLRVOLZ9VOWKVUJVUMNOQJUBCOAQZTACUAASLXUBVCXFWZFXJZLYDCNQVARIWYZRRVS9RWKJHYSRKWXIUNLPWJWYYQEMQAAUKTRXUSKXCPZNMNLI9BEQJAPAWDNCMOAVNIGQMTMCGHBHXJZLBMTVFARBUNFPDJPFYBGFRGJDYLQNMTYHIUZAVEYBSHLOXZ9MDHADDM9F9CKTJPGBZMMNEV9YKGLNYJQRS9PUSXIVWJIUADNFZBBBML9ONXFSAC9MJSGYAQKICRWP9LBGPQKZPPLACTYUMVAFSKWCEB9YAZUKAW9RWZOGAVFRXYZHUE9FPZXDRXCHPGWWUYLQTORQ9AEQMPHLEDQPJVLKWNUSMGZAOR9OIMGAUMFMNGXIZTDEP9FFLFSLJCNUAXHETXT9CLIJG9CWNJVGWZ9UYATOFASOIOCLAYVMSDJINXIHLFCMOQWJFILYWCKSGEOJKIBK9KDFEGRMTPEOBODFVMGSLAZXCBQLNPZIEKTADJYOZGXHBQWDQQYOFMJAKHUFTHWQNKSJKOCRRVMMWEVKSWTDRNCLJAMPIOOUZFKNRMJLIBKSEEQJQQ9RMDMHM9HWWHFOBDFNDANP9GYLORLPAHDQNIMKDMUARFCQEFNBJ9HHPLVBZNWBWETUYLRQHO9QUQXZTJHDVNRSMHWXOJNEJABLEOZCDCSFWLIWM9YBLDXCRNQUGOIDQQJLQSQDXVAIYBCVLXHUJDMZHMEBDIOLWFIEREKFMTLMENROGNMGZUQTQYLVLFSSLEO9JJT9MGUKKVCUZLCVEBMKIPYWAOJRHDJPMXORQXUD9HWNTOISQRQOMVKBDLDKDQICHFUTHIR9QTUOGLBXLROITQWMBEVUOADSANQTDXIRLQ9ARVAYEEGCYYKAUDFWIURWEIEMAGWWPXVWDTMVUZVNYNYFOB9S9WIGHRNYVZBJEBBWQZIBWYIOZLKPGVNNCOLDIIUNNEQZYBD9999999999999999999999999999999999999999999999999999999ZOQMFD99B99999999C99999999APKIUYNXZLRLYCUYJRGTFTSYLCYJYEDCYJAFZOIRTYLLJNUOOJSGKPXLGKWADLHZICOUJXXLHEJSHYJHCLSEIINLCTNVHBJEQEZCFTJBJMTI9OJTJIIFXMUDNXZBOQAJIMQQDWTTWKFJKLDLUFBCVXOGRJIAWA99999V9PJWPAOYWURYYKGZZDBELYBWTXCFIVLJMUDSWWKFQQYTXFPNVJSCKBMDZRRRGBSYTQSWQDAGNZZ9999999999999999999999999999999NGSXGNAVF999999999MMMMMMMMMZVOOETQIXXKTH9VISSPGETBLUTY",
+            "WIJFPCX9BPLELNLCJRPSMXNPLQRYEJFTNBWLNQAJUMICHQAHZYMKWDMSCPZXEZVKMQGZPWQJDQSFNKESXQZHW9HWZUVZAWNHFZTMIDLAWNNPHYOJQUBZNYGFYFRTBMKPXKGNRJGUDULEO9EHSQMPARGCSXVLIRJEWWH9BELGRUQVMHMKSRECL9PXAFJ9JQOGWHNILROQLO9UVYUEFWJLMLMHIUUBZPDAPFDV9JPEPTEWVIAUZOYN9VDDIU9OMVZAWNOGCUJTXXGTPYXRQBDRIMF9NVFBWMKXNGLCXHQEOTJVJQNROTRGTKEHTUKCZBVSHREYWLHPSYUKJXOXMXEBNDIGLJAPKEXVMNFG9SXPUXOPDIGDSQJOALVTK9SLDDKPNAJBQCLEHRMKIDJJXQYZDDJLRUPJWPVZUQNIMDDMLBK9XYXHQZPJRFYIWTPDRYOEBTKIENEIIUGGYVKPUSABQDFJYNSOLHVCPJCITWCUYQBA9B9LNPLKQLPX9A9GAJWQSMJOJPWABUUQF9FVIOAAFIQIBXFIFBFPUACES9YHLAWPUCGMCYPSLK9ITKGDMHRJTIDVMPRQVMPNAJBV9VHJANGMIZDUJQSHAMBNWHJOG9ZURWJSTCKCQVHIYJFGDX9KIWUDGTFAZYGVALVLG9SDWNFMQ9YGKLPWNHZNWUKXUEFTEBZ9DZ9PPAKCDNSBMAICYGSHJZSOGKCWTQTOPTPYPDHQBWAJUDZJXKUO9MQPHAUKIIGYVDRSPVXYABDZJEIUVZKDR9SEACCPYFSFPVVMSVZZWMBUNAPEAIPNHANERACY9ERGHQXBSFIGYORXCIBLBTYVMSZ9IHQGRDSHXKRTZWASOXFGIGGLDKYAVWKGLIIDFDLMPZZDWWHWRSDGRHRSWOBYNRMSYGAGENVITEP9XTCVUXNDO9AQZGWLFVJQXIKGWZG9BYWKPQVHSMZFIGKSHGITHXSVJEDWEYTDIOGHEIINMPLWNZYHIKQVBRQGYFIMIF9DPVJLVJLVKGZGMT9P9U9OJDONSPMZXNMQLBCQB9VEKEKLZGWPGLPUH9KIHBEEAFRHBXZJJQLNSNMWVLWQQTYEROVTYIAEBYTQYBLFPCPFEVBIKHXRMOWJSHVUIQPAODHKMQYHBPPYFDVLODULIHSAIVHRAJQNMVYRVGXAWCY9IDAKWE9HYGKUQPBCCAAHBBGMUVZWNFIHAVIWWJYZLXPYNYUPNRRTHVMVBJCRSIRAOKGJSLOWLYGG9DAJPWQSYDUTWKKJFYVTQKN9ZNJFBHLWWK9FAOXCJZCZQDUYSHDWKWEYJYYRT9TDPOECSGWVCEXQXXIAZTBUXZWEKSGZ9ZFVKUVXPUIBVYVFCTIEBTTAQNTJZKNJ9WKVWYBHSGJNSLEFKMMJJQ9MGDUWLYEALLYGOEMQXHZITVJRILIZ99FVFYKXPEFCUWLIAAERTVNESWUYEBHELWVYPOAKFIQRPHYJOPYKTCPOYQXKXBJFDTKLGWTKXRSZQNVJURPCWQFYRUXBYYBAMRMBRKNQGZDEE9XQKNXOZXOCCNGMRMKTKQAGU9FWNRFVPETBZCQUUANZOQH9VUYY9GYDLKEJHGULOEDFUQPOOUWMYYRRNWDCTPQZYJIZFOZQMOGGHRZJOVJNLP9TZZ99SQYMKMJSGG9NPTIHLJUQIBEIWKOKENHQPNRWWECNQ9LLKVKGALVUGZCCTKJDPMAOZMUTPWUSVEHOPRPKQXE9FOT9MGYNQGKSYKSYLTBGLDN9QXEJMNXF9RCQRPPKQPWFVDRSANEEOFYLWGIBAW9SFTIVNJJRCQSPQSSPAYUAMGKIFLHSYJKNLLYUAFVVMHOSWFELDASAAPQNDYR9XGXSZQNCY9XCYLCMKHUKQGHTMQCFAYHGREJJCWHQZVOLUDMUPFFUJTIBJPUBOPBASHIFWOTNDTLTWPEIIFSWBMMKYR9WZSXZTRJZRLCSVGPJZHWAAKQJHEFZKB9MTFFAOXOUUADGOVWMB9MIQBEDFMFEXDZYWPDUVEBJBHUBVNYYXODBKDZHFIBVVUENTJQZXJVAIFCASYAWFFCRLCZLOPZNADEKGWDWFBAYYXQLOWHKHRQNFWMBLZCFAJNZXXNSAFKZUYEYFJVLHTZFFTWYWAJVBTTJ9MHVNDWCIENVGRM9AZ9VZNAOFPMWTWHAABRZTWFPEPXFWIURWEIEMAGWWPXVWDTMVUZVNYNYFOB9S9WIGHRNYVZBJEBBWQZIBWYIOZLKPGVNNCOLDIIUNNEQZYBD9999999999999999999999999999999999999999999999999999999ZOQMFD99C99999999C99999999APKIUYNXZLRLYCUYJRGTFTSYLCYJYEDCYJAFZOIRTYLLJNUOOJSGKPXLGKWADLHZICOUJXXLHEJSHYJHC9V9PJWPAOYWURYYKGZZDBELYBWTXCFIVLJMUDSWWKFQQYTXFPNVJSCKBMDZRRRGBSYTQSWQDAGNZZ9999VKBQRURURHEB9PXVIAGFNVB9LDZHCVHUZEUDQVMWSZIBQCSGBSVUFDUZBTJKCLUJIDNHDLYXFMWEA9999999999999999999999999999999CAMWGNAVF999999999MMMMMMMMMBNME9RGC9TEKIZHRGZYEJFLWHYS",
+        ];
+        // taken from https://explorer.iota.org/legacy-mainnet/transaction/UAXHEGENCKOFNNWMWKDQDYJMFJVEL9PUYJVFSZODOUVTKXKBKWHMRNSUOQ9QBMONSSJHNUORHYHZ99999
+
+        raw_trytes
+            .into_iter()
+            .map(|tx| {
+                BundledTransaction::from_trits(TryteBuf::try_from_str(tx).unwrap().as_trits())
+                    .expect("Can't build transaction from String")
+            })
+            .collect()
     }
 
-    // Check if there exists a non-lazy tip (requiring no promotion or reattachment)
-    if let Some((hash, _)) = infos
-        .iter()
-        .find(|(_, i)| !i.should_promote && !i.should_reattach && !i.conflicting)
-    {
-        log::debug!(
-            "[MIGRATION] bundle `{}` has a non-lazy tip, tail transaction hash: `{}`",
-            bundle_hash_string,
-            hash.to_inner()
-                .encode::<T3B1Buf>()
-                .iter_trytes()
-                .map(char::from)
-                .collect::<String>()
-        );
-    } else {
-        for (tail_transaction_hash, info) in infos {
-            if info.should_reattach {
-                log::debug!(
-                    "[MIGRATION] reattaching bundle `{}`, tail transaction hash: `{}`",
-                    bundle_hash_string,
-                    tail_transaction_hash
-                        .to_inner()
-                        .encode::<T3B1Buf>()
-                        .iter_trytes()
-                        .map(char::from)
-                        .collect::<String>()
-                );
-                legacy_client.reattach(&tail_transaction_hash).await?.finish().await?;
-                break;
-            }
-        }
+    // #[tokio::test]
+    #[test]
+    fn test_bundle_bin() {
+        let bundle = valid_bundle();
+        let bytes: Vec<u8> = account_manager::migration::isc_param_bytes_from_bundle(bundle);
+        let s: String = bytes.into_iter().map(|b| format!("{b:02X?}")).collect();
+        println!("{s}");
     }
 
-    Ok(false)
+    #[test]
+    fn test_isc_req_bin() {
+        let bundle = valid_bundle();
+        let bytes = account_manager::migration::isc_req_from_bundle(bundle);
+        let s: String = bytes.into_iter().map(|b| format!("{b:02X?}")).collect();
+        println!("{s}");
+    }
 }
